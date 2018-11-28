@@ -41,6 +41,7 @@ import (
 	scfeatures "github.com/kubernetes-incubator/service-catalog/pkg/features"
 	"github.com/kubernetes-incubator/service-catalog/pkg/pretty"
 	"k8s.io/apimachinery/pkg/runtime"
+	"strconv"
 )
 
 const (
@@ -107,6 +108,9 @@ const (
 	maxBrokerOperationRetryDelay time.Duration = time.Minute * 20
 
 	eventHandlerLogLevel = 4 // TODO: move all logLevel settings to a central location
+
+	instanceUsedRetryTime       string = "InstanceUsedRetryTime"
+	defaultUsedRetryTime = 0
 )
 
 type backoffEntry struct {
@@ -573,14 +577,31 @@ func (c *controller) reconcileServiceInstanceAdd(instance *v1beta1.ServiceInstan
 	var prettyClass string
 	var brokerName string
 	var brokerClient osb.Client
+	var instanceRetryTime int
+	var instanceUsedTime int
 	if instance.Spec.ClusterServiceClassSpecified() {
 		var serviceClass *v1beta1.ClusterServiceClass
 		serviceClass, _, brokerName, brokerClient, _ = c.getClusterServiceClassPlanAndClusterServiceBroker(instance)
+		instanceRetryTime = getInstanceMaxRetryTimeOfServiceClass(serviceClass.Annotations)
 		prettyClass = pretty.ClusterServiceClassName(serviceClass)
 	} else {
 		var serviceClass *v1beta1.ServiceClass
 		serviceClass, _, brokerName, brokerClient, _ = c.getServiceClassPlanAndServiceBroker(instance)
+		instanceRetryTime = getInstanceMaxRetryTimeOfServiceClass(serviceClass.Annotations)
 		prettyClass = pretty.ServiceClassName(serviceClass)
+	}
+	instanceRetryTime = getUsedRetryTimeOfInstance(instance.Annotations)
+	if instanceRetryTime == 0{
+		glog.V(4).Info(pcb.Messagef(
+			"The ServiceInstance of %s at Broker %q does not set max retry time",
+			prettyClass, brokerName,
+		))
+	}
+	if instanceRetryTime != 0 && instanceUsedTime >= instanceRetryTime {
+		msg := "Stopping reconciliation retries because the number of retries reached the upper limit set by the service."
+		readyCond := newServiceInstanceReadyCondition(v1beta1.ConditionFalse, errorReconciliationRetryTimeoutReason, msg)
+		failedCond := newServiceInstanceFailedCondition(v1beta1.ConditionTrue, errorReconciliationRetryTimeoutReason, msg)
+		return c.processTerminalProvisionFailure(instance, readyCond, failedCond, false)
 	}
 
 	glog.V(4).Info(pcb.Messagef(
@@ -588,8 +609,13 @@ func (c *controller) reconcileServiceInstanceAdd(instance *v1beta1.ServiceInstan
 		prettyClass, brokerName,
 	))
 
+
 	c.setRetryBackoffRequired(instance)
 	response, err := brokerClient.ProvisionInstance(request)
+
+	if instanceRetryTime != 0 {
+		instance = c.updateServiceInstanceAnnotations(instance)
+	}
 	if err != nil {
 		if httpErr, ok := osb.IsHTTPError(err); ok {
 			msg := fmt.Sprintf(
@@ -1828,6 +1854,30 @@ func (c *controller) updateServiceInstanceReferences(toUpdate *v1beta1.ServiceIn
 	return updatedInstance, err
 }
 
+// updateServiceInstanceReferences updates the refs for the given instance.
+func (c *controller) updateServiceInstanceAnnotations(toUpdate *v1beta1.ServiceInstance) (*v1beta1.ServiceInstance) {
+	pcb := pretty.NewInstanceContextBuilder(toUpdate)
+	glog.V(4).Info(pcb.Message("Updating instance annotations"))
+
+	var updateAnnotations map[string]string
+	for key, value := range toUpdate.Annotations{
+		if key ==  instanceUsedRetryTime{
+			UsedRetryTime, err :=  strconv.Atoi(value)
+			if err != nil || UsedRetryTime < 0 {
+				glog.Warning("The used retry time of instance must be set to a positive integer. It is set to be 0 as default")
+				updateAnnotations[key] = strconv.Itoa(defaultUsedRetryTime + 1)
+			}else {
+				updateAnnotations[key] = strconv.Itoa(UsedRetryTime + 1)
+			}
+		}
+		updateAnnotations[key] = value
+	}
+	// The UpdateReferences method ignores status changes.
+	// Restore status that might have changed locally to be able to update it later.
+	toUpdate.Annotations = updateAnnotations
+	return toUpdate
+}
+
 // updateServiceInstanceWithRetries updates the instance
 // and automatically retries if a 409 Conflict error is
 // returned by the API server.
@@ -2873,4 +2923,35 @@ func setServiceInstanceLastOperation(instance *v1beta1.ServiceInstance, operatio
 		key := string(*operationKey)
 		instance.Status.LastOperation = &key
 	}
+}
+
+func getInstanceMaxRetryTimeOfServiceClass(annovations map[string]string) (int){
+	instanceRetryTime := 0
+	for key, value := range annovations{
+		if key == "MaxRetryTime" {
+			instanceRetryTime, err :=  strconv.Atoi(value)
+			if err != nil {
+				glog.Warning("The max retry time of instance must be set to integer type.")
+			}
+			return instanceRetryTime
+		}
+	}
+	return instanceRetryTime
+}
+
+func getUsedRetryTimeOfInstance(annovations map[string]string) (int){
+	UsedRetryTime := 0
+	for key, value := range annovations{
+		if key ==  instanceUsedRetryTime{
+			instanceUsedRetryTime, err :=  strconv.Atoi(value)
+			if err != nil {
+				glog.Warning("The used retry time of instance must be set to integer type.")
+			}
+			if instanceUsedRetryTime < 0 {
+				glog.Warning("The used retry time of instance must be set to a positive integer.")
+			}
+			return UsedRetryTime
+		}
+	}
+	return UsedRetryTime
 }
